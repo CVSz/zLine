@@ -50,12 +50,15 @@ JWT_SECRET="$(openssl rand -hex 48)"
 
 cat > "$APP_DIR/.env" <<ENVFILE
 DOMAIN=${DOMAIN}
+DB_PASS=${DB_PASS}
+REDIS_PASS=${REDIS_PASS}
 DATABASE_URL=postgresql://zeaz:${DB_PASS}@db:5432/zeaz
 JWT_SECRET=${JWT_SECRET}
 REDIS_URL=redis://:${REDIS_PASS}@redis:6379/0
 KAFKA_BROKER=kafka:9092
 OPENAI_API_KEY=REPLACE
 ENVFILE
+chmod 600 "$APP_DIR/.env"
 
 cat > "$APP_DIR/db/init.sql" <<'SQL'
 CREATE TABLE IF NOT EXISTS users(
@@ -104,18 +107,23 @@ import os
 import time
 import json
 from threading import Lock
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from jose import jwt, JWTError
-from passlib.hash import bcrypt
+from passlib.context import CryptContext
 from kafka import KafkaProducer
 from redis import Redis
 
 SECRET = os.getenv("JWT_SECRET", "")
 DB = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
 REDIS = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
 producer = KafkaProducer(
     bootstrap_servers=os.getenv("KAFKA_BROKER"),
     value_serializer=lambda v: json.dumps(v).encode()
@@ -153,15 +161,19 @@ class ChatIn(BaseModel):
 
 
 def issue_token(username: str, role: str) -> str:
-    return jwt.encode({"sub": username, "role": role, "exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+    payload = {
+        "sub": username,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+    }
+    return jwt.encode(payload, SECRET, algorithm="HS256")
 
 
-def authz(authorization: str = Header(default="")):
-    if not authorization.startswith("Bearer "):
+def authz(credentials: HTTPAuthorizationCredentials = Security(security)):
+    if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(401, "missing_token")
-    token = authorization.split(" ", 1)[1]
     try:
-        return jwt.decode(token, SECRET, algorithms=["HS256"])
+        return jwt.decode(credentials.credentials, SECRET, algorithms=["HS256"])
     except JWTError:
         raise HTTPException(401, "invalid_token")
 
@@ -186,14 +198,14 @@ def health():
 
 @app.post("/register")
 def register(user: UserIn):
-    with DB.begin() as conn:
-        exists = conn.execute(text("SELECT 1 FROM users WHERE username=:u"), {"u": user.username}).fetchone()
-        if exists:
-            raise HTTPException(409, "username_exists")
-        conn.execute(
-            text("INSERT INTO users(username,password,role) VALUES(:u,:p,'user')"),
-            {"u": user.username, "p": bcrypt.hash(user.password)}
-        )
+    try:
+        with DB.begin() as conn:
+            conn.execute(
+                text("INSERT INTO users(username,password,role) VALUES(:u,:p,'user')"),
+                {"u": user.username, "p": pwd_context.hash(user.password)}
+            )
+    except IntegrityError:
+        raise HTTPException(409, "username_exists")
     return {"ok": True}
 
 
@@ -201,7 +213,7 @@ def register(user: UserIn):
 def login(user: UserIn):
     with DB.begin() as conn:
         row = conn.execute(text("SELECT password, role FROM users WHERE username=:u"), {"u": user.username}).fetchone()
-    if not row or not bcrypt.verify(user.password, row[0]):
+    if not row or not pwd_context.verify(user.password, row[0]):
         raise HTTPException(401, "invalid_credentials")
     return {"token": issue_token(user.username, row[1])}
 
@@ -280,12 +292,17 @@ HTML
 cat > "$APP_DIR/infra/nginx.conf" <<'NGINX'
 events {}
 http {
+  limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
   server {
     listen 80;
     add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
 
     location /api/ {
+      limit_req zone=api_limit burst=20 nodelay;
       proxy_pass http://api:8000/;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
@@ -328,12 +345,14 @@ services:
       retries: 3
     volumes:
       - ../logs:/app/logs
+    networks: [internal]
 
   worker:
     build: ../worker
     env_file: ../.env
     restart: always
     depends_on: [db, kafka]
+    networks: [internal]
 
   db:
     image: postgres:15
@@ -345,6 +364,7 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
       - ../db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks: [internal]
 
   redis:
     image: redis:7
@@ -352,12 +372,14 @@ services:
     command: ["redis-server","--requirepass","${REDIS_PASS}","--appendonly","yes"]
     volumes:
       - redis_data:/data
+    networks: [internal]
 
   zookeeper:
     image: bitnami/zookeeper:latest
     restart: always
     environment:
       ALLOW_ANONYMOUS_LOGIN: "yes"
+    networks: [internal]
 
   kafka:
     image: bitnami/kafka:latest
@@ -371,6 +393,7 @@ services:
       KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CFG_LOG_RETENTION_HOURS: 168
       ALLOW_PLAINTEXT_LISTENER: "yes"
+    networks: [internal]
 
   nginx:
     build:
@@ -380,11 +403,17 @@ services:
     ports:
       - "80:80"
     depends_on: [api]
+    networks: [internal, public]
 
 volumes:
   db_data:
   redis_data:
   kafka_data:
+
+networks:
+  internal:
+    internal: true
+  public:
 COMPOSE
 
 cat > "$APP_DIR/backup/backup.sh" <<'BASH'
