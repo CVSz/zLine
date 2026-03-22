@@ -2,6 +2,8 @@ import Hero from "./components/Hero";
 import Features from "./components/Features";
 import DemoChat from "./components/DemoChat";
 
+const PRICE_ID = "price_basic_9usd";
+
 export default function App() {
   const startCheckout = async () => {
     const res = await fetch("/api/create-checkout", { method: "POST" });
