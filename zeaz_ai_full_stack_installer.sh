@@ -42,23 +42,39 @@ systemctl start docker
 
 log "[3/8] Generate project files"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR"/{api,worker,infra,panels/{admin,user,devops},backup,monitor,logs,db}
+mkdir -p "$APP_DIR"/{api,worker,infra,panels/{admin,user,devops},backup,monitor,logs,db,certs}
 
 DB_PASS="$(openssl rand -hex 32)"
 REDIS_PASS="$(openssl rand -hex 32)"
-JWT_SECRET="$(openssl rand -hex 48)"
+JWT_SECRET_CURRENT="$(openssl rand -hex 48)"
+JWT_SECRET_PREVIOUS=""
+KAFKA_USER="zeaz_app"
+KAFKA_PASS="$(openssl rand -hex 24)"
 
 cat > "$APP_DIR/.env" <<ENVFILE
 DOMAIN=${DOMAIN}
 DB_PASS=${DB_PASS}
 REDIS_PASS=${REDIS_PASS}
 DATABASE_URL=postgresql://zeaz:${DB_PASS}@db:5432/zeaz
-JWT_SECRET=${JWT_SECRET}
+JWT_SECRET=${JWT_SECRET_CURRENT}
+JWT_SECRET_CURRENT=${JWT_SECRET_CURRENT}
+JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS}
 REDIS_URL=redis://:${REDIS_PASS}@redis:6379/0
 KAFKA_BROKER=kafka:9092
+KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
+KAFKA_SASL_MECHANISM=PLAIN
+KAFKA_USERNAME=${KAFKA_USER}
+KAFKA_PASSWORD=${KAFKA_PASS}
 OPENAI_API_KEY=REPLACE
 ENVFILE
 chmod 600 "$APP_DIR/.env"
+
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout "$APP_DIR/certs/tls.key" \
+  -out "$APP_DIR/certs/tls.crt" \
+  -days 365 \
+  -subj "/CN=${DOMAIN}"
+chmod 600 "$APP_DIR/certs/tls.key"
 
 cat > "$APP_DIR/db/init.sql" <<'SQL'
 CREATE TABLE IF NOT EXISTS users(
@@ -75,6 +91,8 @@ CREATE TABLE IF NOT EXISTS messages(
   content TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_tenant ON messages(tenant_id);
 SQL
 
 cat > "$APP_DIR/api/requirements.txt" <<'REQ'
@@ -106,10 +124,12 @@ cat > "$APP_DIR/api/main.py" <<'PYCODE'
 import os
 import time
 import json
+import zlib
 from threading import Lock
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Security
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -119,14 +139,27 @@ from passlib.context import CryptContext
 from kafka import KafkaProducer
 from redis import Redis
 
-SECRET = os.getenv("JWT_SECRET", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+JWT_PRIMARY = os.getenv("JWT_SECRET_CURRENT") or os.getenv("JWT_SECRET", "")
+JWT_FALLBACK = [k for k in os.getenv("JWT_SECRET_PREVIOUS", "").split(",") if k]
+JWT_KEYS = [JWT_PRIMARY, *JWT_FALLBACK]
+if not JWT_PRIMARY:
+    raise RuntimeError("JWT secret is required")
+if OPENAI_API_KEY in {"", "REPLACE"}:
+    raise RuntimeError("OPENAI_API_KEY must be set to a real key before startup")
 DB = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
 REDIS = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 producer = KafkaProducer(
     bootstrap_servers=os.getenv("KAFKA_BROKER"),
-    value_serializer=lambda v: json.dumps(v).encode()
+    value_serializer=lambda v: json.dumps(v).encode(),
+    retries=5,
+    request_timeout_ms=5000,
+    security_protocol=os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+    sasl_mechanism=os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+    sasl_plain_username=os.getenv("KAFKA_USERNAME"),
+    sasl_plain_password=os.getenv("KAFKA_PASSWORD"),
 )
 
 class CircuitBreaker:
@@ -151,6 +184,13 @@ class CircuitBreaker:
 
 cb = CircuitBreaker()
 app = FastAPI(title="ZEAZ SaaS API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "https://localhost").split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+)
 
 class UserIn(BaseModel):
     username: str = Field(min_length=3, max_length=64)
@@ -166,16 +206,18 @@ def issue_token(username: str, role: str) -> str:
         "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(hours=1),
     }
-    return jwt.encode(payload, SECRET, algorithm="HS256")
+    return jwt.encode(payload, JWT_PRIMARY, algorithm="HS256")
 
 
 def authz(credentials: HTTPAuthorizationCredentials = Security(security)):
     if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(401, "missing_token")
-    try:
-        return jwt.decode(credentials.credentials, SECRET, algorithms=["HS256"])
-    except JWTError:
-        raise HTTPException(401, "invalid_token")
+    for key in JWT_KEYS:
+        try:
+            return jwt.decode(credentials.credentials, key, algorithms=["HS256"])
+        except JWTError:
+            continue
+    raise HTTPException(401, "invalid_token")
 
 
 def check_rate_limit(subject: str):
@@ -222,7 +264,11 @@ def login(user: UserIn):
 def chat(req: ChatIn, claims=Depends(authz), x_api_key: str = Header(default="")):
     check_rate_limit(claims["sub"])
     reply = cb.call(noop_ai, req.message)
-    producer.send("events.messages", key=claims["sub"].encode(), value={"tenant": claims["sub"], "msg": req.message})
+    producer.send(
+        "events.messages",
+        key=claims["sub"].encode(),
+        value={"tenant": claims["sub"], "tenant_id": zlib.crc32(claims["sub"].encode()) + 1, "msg": req.message},
+    )
     return {"reply": reply, "x_api_key_seen": bool(x_api_key)}
 
 
@@ -260,20 +306,33 @@ from sqlalchemy import create_engine, text
 DB = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
 producer = KafkaProducer(
     bootstrap_servers=os.getenv("KAFKA_BROKER"),
-    value_serializer=lambda v: json.dumps(v).encode()
+    value_serializer=lambda v: json.dumps(v).encode(),
+    retries=5,
+    request_timeout_ms=5000,
+    security_protocol=os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+    sasl_mechanism=os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+    sasl_plain_username=os.getenv("KAFKA_USERNAME"),
+    sasl_plain_password=os.getenv("KAFKA_PASSWORD"),
 )
 consumer = KafkaConsumer(
     "events.messages",
     bootstrap_servers=os.getenv("KAFKA_BROKER"),
     enable_auto_commit=False,
-    value_deserializer=lambda m: json.loads(m.decode())
+    value_deserializer=lambda m: json.loads(m.decode()),
+    security_protocol=os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+    sasl_mechanism=os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+    sasl_plain_username=os.getenv("KAFKA_USERNAME"),
+    sasl_plain_password=os.getenv("KAFKA_PASSWORD"),
 )
 
 for msg in consumer:
     try:
         with DB.begin() as conn:
+            tenant_id = int(msg.value.get("tenant_id", 0))
+            if tenant_id <= 0:
+                raise ValueError("missing tenant_id")
             conn.execute(text("INSERT INTO messages(tenant_id,content) VALUES(:t,:c)"),
-                         {"t": 1, "c": msg.value.get("msg", "")})
+                         {"t": tenant_id, "c": msg.value.get("msg", "")})
         consumer.commit()
     except Exception:
         producer.send("events.dlq", msg.value)
@@ -293,13 +352,25 @@ cat > "$APP_DIR/infra/nginx.conf" <<'NGINX'
 events {}
 http {
   limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+  limit_conn_zone $binary_remote_addr zone=perip:10m;
+  gzip on;
+  gzip_types text/plain text/css application/json application/javascript application/xml+rss;
+  client_max_body_size 1m;
 
   server {
     listen 80;
+    return 301 https://$host$request_uri;
+  }
+
+  server {
+    listen 443 ssl;
+    ssl_certificate /etc/nginx/certs/tls.crt;
+    ssl_certificate_key /etc/nginx/certs/tls.key;
     add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    limit_conn perip 30;
 
     location /api/ {
       limit_req zone=api_limit burst=20 nodelay;
@@ -326,6 +397,7 @@ NGINX
 cat > "$APP_DIR/infra/nginx.Dockerfile" <<'DOCKER'
 FROM nginx:alpine
 COPY infra/nginx.conf /etc/nginx/nginx.conf
+COPY certs /etc/nginx/certs
 COPY panels/admin /usr/share/nginx/html/admin
 COPY panels/user /usr/share/nginx/html/user
 COPY panels/devops /usr/share/nginx/html/devops
@@ -369,7 +441,7 @@ services:
   redis:
     image: redis:7
     restart: always
-    command: ["redis-server","--requirepass","${REDIS_PASS}","--appendonly","yes"]
+    command: ["redis-server","--requirepass","${REDIS_PASS}","--appendonly","yes","--bind","0.0.0.0","--protected-mode","yes"]
     volumes:
       - redis_data:/data
     networks: [internal]
@@ -378,7 +450,10 @@ services:
     image: bitnami/zookeeper:latest
     restart: always
     environment:
-      ALLOW_ANONYMOUS_LOGIN: "yes"
+      ALLOW_ANONYMOUS_LOGIN: "no"
+      ZOO_ENABLE_AUTH: "yes"
+      ZOO_SERVER_USERS: ${KAFKA_USER}
+      ZOO_SERVER_PASSWORDS: ${KAFKA_PASS}
     networks: [internal]
 
   kafka:
@@ -389,10 +464,18 @@ services:
       - kafka_data:/bitnami/kafka
     environment:
       KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ZOOKEEPER_PROTOCOL: SASL
+      KAFKA_ZOOKEEPER_USER: ${KAFKA_USER}
+      KAFKA_ZOOKEEPER_PASSWORD: ${KAFKA_PASS}
+      KAFKA_CFG_LISTENERS: SASL_PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: SASL_PLAINTEXT:SASL_PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      KAFKA_CFG_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_CLIENT_USERS: ${KAFKA_USER}
+      KAFKA_CLIENT_PASSWORDS: ${KAFKA_PASS}
       KAFKA_CFG_LOG_RETENTION_HOURS: 168
-      ALLOW_PLAINTEXT_LISTENER: "yes"
     networks: [internal]
 
   nginx:
@@ -402,6 +485,7 @@ services:
     restart: always
     ports:
       - "80:80"
+      - "443:443"
     depends_on: [api]
     networks: [internal, public]
 
@@ -421,7 +505,8 @@ cat > "$APP_DIR/backup/backup.sh" <<'BASH'
 set -euo pipefail
 TS=$(date +%F_%H-%M)
 FILE="/opt/zeaz-v2/backup/db_${TS}.sql.gz"
-docker exec $(docker ps -qf name=db) pg_dump -U zeaz zeaz | gzip > "$FILE"
+DB_CONTAINER=$(docker compose -f /opt/zeaz-v2/infra/docker-compose.yml ps -q db)
+docker exec "$DB_CONTAINER" pg_dump -U zeaz zeaz | gzip > "$FILE"
 test -s "$FILE"
 find /opt/zeaz-v2/backup -type f -mtime +7 -delete
 BASH
@@ -431,6 +516,7 @@ cat > "$APP_DIR/monitor/health.sh" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 curl -fs http://localhost/ >/dev/null || echo "ALERT: nginx down"
+curl -kfs https://localhost/ >/dev/null || echo "ALERT: nginx down (https)"
 BASH
 chmod +x "$APP_DIR/monitor/health.sh"
 
@@ -445,11 +531,11 @@ log "[5/8] Setup cron"
 log "[6/8] Completed"
 cat <<MSG
 Installed at: ${APP_DIR}
-URL: http://${DOMAIN}
+URL: https://${DOMAIN}
 Panels:
-  - http://${DOMAIN}/admin/
-  - http://${DOMAIN}/user/
-  - http://${DOMAIN}/devops/
+  - https://${DOMAIN}/admin/
+  - https://${DOMAIN}/user/
+  - https://${DOMAIN}/devops/
 API:
   - POST /api/register
   - POST /api/login
