@@ -52,6 +52,7 @@ JWT_SECRET_CURRENT="$(openssl rand -hex 48)"
 JWT_SECRET_PREVIOUS=""
 KAFKA_USER="zeaz_app"
 KAFKA_PASS="$(openssl rand -hex 24)"
+ADMIN_PASS="$(openssl rand -base64 18)"
 
 cat > "$APP_DIR/.env" <<ENVFILE
 DOMAIN=${DOMAIN}
@@ -98,6 +99,11 @@ chmod 600 "$APP_DIR/worker/worker.env"
 
 if [[ -n "$CERT_EMAIL" && "$DOMAIN" != "localhost" && "$DOMAIN" != *.local ]]; then
   log "Attempting Let's Encrypt certificate for ${DOMAIN}"
+  OCCUPYING_CONTAINERS="$(docker ps --filter publish=80 --format '{{.ID}}')"
+  if [[ -n "${OCCUPYING_CONTAINERS}" ]]; then
+    log "Stopping containers bound to port 80 for certbot standalone challenge"
+    docker stop ${OCCUPYING_CONTAINERS} >/dev/null
+  fi
   if certbot certonly --standalone --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$DOMAIN"; then
     cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$APP_DIR/certs/tls.crt"
     cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$APP_DIR/certs/tls.key"
@@ -122,7 +128,7 @@ else
   chmod 600 "$APP_DIR/certs/tls.key"
 fi
 
-cat > "$APP_DIR/db/init.sql" <<'SQL'
+cat > "$APP_DIR/db/init.sql" <<SQL
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS users(
@@ -154,7 +160,7 @@ CREATE TABLE IF NOT EXISTS audit_logs(
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
 
 INSERT INTO users(username,password,role)
-VALUES('admin', crypt('ChangeMeNow!2026', gen_salt('bf', 12)), 'admin')
+VALUES('admin', crypt('${ADMIN_PASS}', gen_salt('bf', 12)), 'admin')
 ON CONFLICT (username) DO NOTHING;
 SQL
 
@@ -584,23 +590,16 @@ http {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self';" always;
+    add_header Content-Security-Policy "default-src 'self'; connect-src 'self' https:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';" always;
     add_header Referrer-Policy "no-referrer" always;
     add_header Permissions-Policy "geolocation=()" always;
     add_header Cross-Origin-Opener-Policy "same-origin" always;
     add_header Cross-Origin-Embedder-Policy "require-corp" always;
     limit_conn perip 30;
 
-    location = /api/login {
-      limit_req zone=api_limit burst=5 nodelay;
-      proxy_pass http://api:8000/login;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-    }
-
     location /api/ {
       limit_req zone=api_limit burst=20 nodelay;
-      proxy_pass http://api:8000/;
+      proxy_pass http://api:8000;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
     }
@@ -647,18 +646,20 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    volumes:
-      - ../logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     read_only: true
     tmpfs:
       - /tmp
+      - /app/logs
     security_opt:
       - no-new-privileges:true
     cap_drop: ["ALL"]
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+    mem_limit: 1g
+    cpus: 1.0
     networks: [internal]
 
   worker:
@@ -673,18 +674,22 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     security_opt:
       - no-new-privileges:true
     cap_drop: ["ALL"]
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+    mem_limit: 1g
+    cpus: 1.0
     networks: [internal]
 
   db:
     image: postgres:15
     restart: always
+    command: ["postgres", "-c", "max_connections=100"]
     environment:
       POSTGRES_DB: zeaz
       POSTGRES_USER: zeaz
@@ -697,16 +702,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 1g
+    cpus: 1.0
     networks: [internal]
 
   redis:
     image: redis:7
     restart: always
-    command: ["redis-server","--requirepass","${REDIS_PASS}","--appendonly","yes","--bind","0.0.0.0","--protected-mode","yes"]
+    command: ["redis-server","--requirepass","${REDIS_PASS}","--appendonly","yes","--bind","0.0.0.0","--protected-mode","no"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -714,10 +722,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+    cpus: 0.5
     networks: [internal]
 
   zookeeper:
@@ -728,6 +739,13 @@ services:
       ZOO_ENABLE_AUTH: "yes"
       ZOO_SERVER_USERS: ${KAFKA_USER}
       ZOO_SERVER_PASSWORDS: ${KAFKA_PASS}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+    cpus: 0.5
     networks: [internal]
 
   kafka:
@@ -752,14 +770,17 @@ services:
       KAFKA_CLIENT_PASSWORDS: ${KAFKA_PASS}
       KAFKA_CFG_LOG_RETENTION_HOURS: 168
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
       interval: 15s
       timeout: 10s
       retries: 10
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 1g
+    cpus: 1.0
     networks: [internal]
 
   nginx:
@@ -773,6 +794,11 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     read_only: true
     tmpfs:
       - /var/cache/nginx
@@ -781,10 +807,13 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: ["ALL"]
-    deploy:
-      resources:
-        limits:
-          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 256m
+    cpus: 0.5
     networks: [internal, public]
 
 volumes:
@@ -815,6 +844,7 @@ fi
 openssl enc -aes-256-cbc -pbkdf2 -salt -in "$FILE" -out "$ENCRYPTED_FILE" -pass "file:${BACKUP_KEY_FILE}"
 rm -f "$FILE"
 test -s "$ENCRYPTED_FILE"
+openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENCRYPTED_FILE" -pass "file:${BACKUP_KEY_FILE}" | gunzip -c | head >/dev/null
 find /opt/zeaz-v2/backup -type f -mtime +7 -delete
 BASH
 chmod +x "$APP_DIR/backup/backup.sh"
@@ -829,6 +859,7 @@ chmod +x "$APP_DIR/monitor/health.sh"
 
 log "[4/8] Start stack"
 cd "$APP_DIR/infra"
+cp "$APP_DIR/.env" "$APP_DIR/infra/.env"
 docker compose up -d --build
 log "Waiting for DB..."
 until docker compose exec -T db pg_isready -U zeaz -d zeaz >/dev/null 2>&1; do
@@ -841,6 +872,10 @@ until docker compose exec -T kafka kafka-topics.sh --bootstrap-server kafka:9092
 done
 
 log "Creating Kafka topics..."
+for i in {1..10}; do
+  docker compose exec -T kafka kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1 && break
+  sleep 3
+done
 docker compose exec -T kafka kafka-topics.sh --create --if-not-exists --topic events.messages \
   --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1
 docker compose exec -T kafka kafka-topics.sh --create --if-not-exists --topic events.dlq \
@@ -849,8 +884,9 @@ docker compose exec -T kafka kafka-topics.sh --create --if-not-exists --topic ev
 log "[5/8] Setup firewall and cron"
 ufw --force default deny incoming
 ufw --force default allow outgoing
-ufw --force allow 80/tcp
-ufw --force allow 443/tcp
+ufw --force limit 22/tcp
+ufw --force limit 80/tcp
+ufw --force limit 443/tcp
 ufw --force enable
 
 (crontab -l 2>/dev/null; echo "0 3 * * * ${APP_DIR}/backup/backup.sh") | crontab -
@@ -865,6 +901,26 @@ ${APP_DIR}/logs/*.log {
   notifempty
 }
 EOF
+
+cat > /etc/systemd/system/zeaz.service <<EOF
+[Unit]
+Description=ZEAZ Stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=${APP_DIR}/infra
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable zeaz
 
 if [[ -n "$CERT_EMAIL" && "$DOMAIN" != "localhost" && "$DOMAIN" != *.local ]]; then
   (crontab -l 2>/dev/null; echo "0 2 * * * certbot renew --quiet && docker compose -f ${APP_DIR}/infra/docker-compose.yml restart nginx") | crontab -
@@ -885,7 +941,7 @@ API:
 NOTE: Update OPENAI_API_KEY in ${APP_DIR}/api/api.env before production usage.
 NOTE: API will still start without OPENAI_API_KEY and return "AI not configured" for chat responses.
 NOTE: For trusted TLS, rerun with --cert-email admin@your-domain on a publicly-resolvable domain.
-NOTE: Bootstrap admin user is created with username 'admin' and password 'ChangeMeNow!2026' (rotate immediately).
+NOTE: Bootstrap admin user is created with username 'admin' and generated password '${ADMIN_PASS}' (rotate immediately).
 API-specific secrets: ${APP_DIR}/api/api.env
 Worker-specific secrets: ${APP_DIR}/worker/worker.env
 MSG
