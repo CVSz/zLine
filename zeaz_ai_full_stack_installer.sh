@@ -9,7 +9,7 @@ set -euo pipefail
 
 DOMAIN=""
 CERT_EMAIL=""
-APP_DIR="/opt/zeaz-v2"
+APP_DIR="/opt/zeaz-v3"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,7 +44,7 @@ systemctl start docker
 
 log "[3/8] Generate project files"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR"/{api,worker,analytics,infra,panels/{admin,user,devops},backup,monitor,logs,db,certs}
+mkdir -p "$APP_DIR"/{api,worker,agent,control,analytics,infra,panels/{admin,user,devops},backup,monitor,logs,db,certs,prometheus}
 
 DB_PASS="$(openssl rand -hex 32)"
 REDIS_PASS="$(openssl rand -hex 32)"
@@ -70,6 +70,8 @@ KAFKA_SECURITY_PROTOCOL=SASL_PLAINTEXT
 KAFKA_SASL_MECHANISM=PLAIN
 KAFKA_USERNAME=${KAFKA_USER}
 KAFKA_PASSWORD=${KAFKA_PASS}
+ENABLE_AGENTS=true
+MAX_DAILY_SPEND=500
 ENVFILE
 chmod 600 "$APP_DIR/.env"
 
@@ -137,6 +139,111 @@ else
     -subj "/CN=${DOMAIN}"
   chmod 600 "$APP_DIR/certs/tls.key"
 fi
+
+cat > "$APP_DIR/control/requirements.txt" <<'REQ'
+fastapi==0.110.0
+uvicorn==0.29.0
+REQ
+
+cat > "$APP_DIR/control/Dockerfile" <<'DOCKER'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8080"]
+DOCKER
+
+cat > "$APP_DIR/control/main.py" <<'PYCODE'
+from fastapi import FastAPI
+import os
+
+app = FastAPI()
+SYSTEM_ENABLED = True
+
+@app.get("/status")
+def status():
+    return {"system": SYSTEM_ENABLED, "env": os.getenv("ENV", "production")}
+
+@app.post("/kill")
+def kill():
+    global SYSTEM_ENABLED
+    SYSTEM_ENABLED = False
+    return {"status": "stopped"}
+
+@app.post("/start")
+def start():
+    global SYSTEM_ENABLED
+    SYSTEM_ENABLED = True
+    return {"status": "running"}
+PYCODE
+
+cat > "$APP_DIR/agent/requirements.txt" <<'REQ'
+requests==2.32.3
+REQ
+
+cat > "$APP_DIR/agent/Dockerfile" <<'DOCKER'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python","agent.py"]
+DOCKER
+
+cat > "$APP_DIR/agent/agent.py" <<'PYCODE'
+import os
+import time
+
+import requests
+
+CONTROL_URL = os.getenv("CONTROL_URL", "http://control:8080")
+MAX_SPEND = int(os.getenv("MAX_DAILY_SPEND", "100"))
+
+def check_budget(amount: int) -> None:
+    if amount > MAX_SPEND:
+        raise RuntimeError("budget_exceeded")
+
+def system_enabled() -> bool:
+    try:
+        response = requests.get(f"{CONTROL_URL}/status", timeout=2)
+        response.raise_for_status()
+        return bool(response.json().get("system"))
+    except Exception:
+        return False
+
+def run() -> None:
+    while True:
+        if not system_enabled():
+            time.sleep(5)
+            continue
+
+        try:
+            check_budget(0)
+            print("Agent running business logic...")
+        except RuntimeError as exc:
+            print(f"Agent halted: {exc}")
+            time.sleep(10)
+            continue
+
+        time.sleep(3)
+
+if __name__ == "__main__":
+    run()
+PYCODE
+
+cat > "$APP_DIR/prometheus/prometheus.yml" <<'PROM'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "api"
+    static_configs:
+      - targets: ["api:8000"]
+  - job_name: "control"
+    static_configs:
+      - targets: ["control:8080"]
+PROM
 
 cat > "$APP_DIR/db/init.sql" <<SQL
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -1175,6 +1282,40 @@ services:
     cpus: 0.5
     networks: [internal]
 
+  control:
+    build: ../control
+    restart: always
+    networks: [internal]
+
+  agent:
+    build: ../agent
+    restart: always
+    environment:
+      CONTROL_URL: http://control:8080
+      MAX_DAILY_SPEND: ${MAX_DAILY_SPEND}
+      ENABLE_AGENTS: ${ENABLE_AGENTS}
+    depends_on:
+      - control
+    networks: [internal]
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [internal, public]
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks: [internal, public]
+
   db:
     image: postgres:15
     restart: always
@@ -1354,10 +1495,10 @@ cat > "$APP_DIR/backup/backup.sh" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 TS=$(date +%F_%H-%M)
-FILE="/opt/zeaz-v2/backup/db_${TS}.sql.gz"
+FILE="/opt/zeaz-v3/backup/db_${TS}.sql.gz"
 ENCRYPTED_FILE="${FILE}.enc"
-BACKUP_KEY_FILE="/opt/zeaz-v2/backup/.backup_key"
-DB_CONTAINER=$(docker compose -f /opt/zeaz-v2/infra/docker-compose.yml ps -q db)
+BACKUP_KEY_FILE="/opt/zeaz-v3/backup/.backup_key"
+DB_CONTAINER=$(docker compose -f /opt/zeaz-v3/infra/docker-compose.yml ps -q db)
 docker exec "$DB_CONTAINER" pg_dump -U zeaz zeaz | gzip > "$FILE"
 test -s "$FILE"
 if [[ ! -f "$BACKUP_KEY_FILE" ]]; then
@@ -1368,7 +1509,7 @@ openssl enc -aes-256-cbc -pbkdf2 -salt -in "$FILE" -out "$ENCRYPTED_FILE" -pass 
 rm -f "$FILE"
 test -s "$ENCRYPTED_FILE"
 openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENCRYPTED_FILE" -pass "file:${BACKUP_KEY_FILE}" | gunzip -c | head >/dev/null
-find /opt/zeaz-v2/backup -type f -mtime +7 -delete
+find /opt/zeaz-v3/backup -type f -mtime +7 -delete
 BASH
 chmod +x "$APP_DIR/backup/backup.sh"
 
@@ -1431,7 +1572,7 @@ ufw --force limit 80/tcp
 ufw --force limit 443/tcp
 ufw --force enable
 
-(crontab -l 2>/dev/null; echo "0 3 * * * ${APP_DIR}/backup/backup.sh") | crontab -
+(crontab -l 2>/dev/null; echo "0 */6 * * * ${APP_DIR}/backup/backup.sh") | crontab -
 (crontab -l 2>/dev/null; echo "*/5 * * * * ${APP_DIR}/monitor/health.sh") | crontab -
 
 cat > /etc/logrotate.d/zeaz <<EOF
@@ -1480,6 +1621,13 @@ API:
   - POST /api/register
   - POST /api/login
   - POST /api/chat (Bearer token)
+Control plane:
+  - GET http://localhost:8080/status
+  - POST http://localhost:8080/kill
+  - POST http://localhost:8080/start
+Observability:
+  - http://localhost:9090 (Prometheus)
+  - http://localhost:3000 (Grafana)
 NOTE: Update OPENAI_API_KEY in ${APP_DIR}/api/api.env before production usage.
 NOTE: API will still start without OPENAI_API_KEY and return "AI not configured" for chat responses.
 NOTE: For trusted TLS, rerun with --cert-email admin@your-domain on a publicly-resolvable domain.
