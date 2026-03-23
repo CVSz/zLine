@@ -1,13 +1,29 @@
 import React from "react";
-import Hero from "./components/Hero";
-import Features from "./components/Features";
 import CTA from "./components/CTA";
+import LandingPage from "./pages/LandingPage";
+import LoginPage from "./pages/LoginPage";
+import SignupPage from "./pages/SignupPage";
+
+function resolveRoute(pathname) {
+  if (pathname.startsWith("/signup")) {
+    return "signup";
+  }
+
+  if (pathname.startsWith("/login")) {
+    return "login";
+  }
+
+  return "landing";
+}
 
 export default function App() {
+  const route = resolveRoute(window.location.pathname);
+
   return (
-    <div className="font-sans text-slate-900">
-      <Hero />
-      <Features />
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      {route === "landing" ? <LandingPage /> : null}
+      {route === "signup" ? <SignupPage /> : null}
+      {route === "login" ? <LoginPage /> : null}
       <CTA />
     </div>
   );
