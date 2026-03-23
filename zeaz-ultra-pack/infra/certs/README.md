@@ -1,6 +1,15 @@
-Place TLS files here for local testing:
-- fullchain.pem
-- privkey.pem
+Place TLS certs in this directory:
 
-You can generate a self-signed cert for local use with:
-openssl req -x509 -nodes -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -days 365 -subj "/CN=cme.zeaz.dev"
+- `fullchain.pem`
+- `privkey.pem`
+
+Example self-signed cert for wildcard + cme:
+
+```bash
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout privkey.pem \
+  -out fullchain.pem \
+  -days 365 \
+  -subj "/CN=*.zeaz.dev" \
+  -addext "subjectAltName=DNS:*.zeaz.dev,DNS:cme.zeaz.dev"
+```

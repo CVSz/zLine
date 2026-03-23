@@ -7,7 +7,7 @@ Self-contained full stack starter with:
 - Worker + Kafka + Redis + Postgres.
 - NGINX TLS reverse proxy for `/api/`, `/admin/`, `/user/`, `/devops/`.
 - Docker Compose infra with healthchecks, memory/CPU limits, and internal/public networks.
-- Optional Cloudflared tunnel mapping `cme.zeaz.dev` to your local nginx service.
+- Optional Cloudflared tunnel mapping full stack hostnames on `*.zeaz.dev` plus `cme.zeaz.dev` to local nginx.
 - Backup + monitoring scripts.
 
 ## Structure
@@ -27,7 +27,7 @@ zeaz-ultra-pack/
 
 ```bash
 cd zeaz-ultra-pack
-./gen-secrets.sh cme.zeaz.dev admin@cme.zeaz.dev
+./gen-secrets.sh zeaz.dev admin@zeaz.dev
 ```
 
 2. Start stack.
@@ -39,11 +39,12 @@ docker compose --env-file ../.env up -d --build
 
 `nginx` generates a self-signed certificate automatically when `infra/certs/fullchain.pem` and `infra/certs/privkey.pem` are not provided.
 
-## Optional: Cloudflared for `cme.zeaz.dev`
+## Optional: Cloudflared for full stack `*.zeaz.dev` + `cme.zeaz.dev`
 
 1. Follow `infra/cloudflared/README.md` and place your tunnel credentials JSON at `infra/cloudflared/credentials.json`.
 2. Ensure `.env` has `CLOUDFLARED_TUNNEL_ID=<tunnel-uuid>`.
-3. Start the Cloudflare profile:
+3. Route both `*.zeaz.dev` and `cme.zeaz.dev` to the same tunnel in Cloudflare DNS / Zero Trust.
+4. Start the Cloudflare profile:
 
 ```bash
 cd infra
@@ -71,6 +72,7 @@ docker compose --env-file ../.env up -d --build nginx
 - `https://<host>/admin/`
 - `https://<host>/user/`
 - `https://<host>/devops/`
+- `https://*.zeaz.dev/` (when Cloudflared tunnel is enabled)
 - `https://cme.zeaz.dev/` (when Cloudflared tunnel is enabled)
 
 ## Health Monitoring

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="${1:-cme.zeaz.dev}"
+DOMAIN="${1:-zeaz.dev}"
 CERT_EMAIL="${2:-admin@${DOMAIN}}"
 
 DB_PASS="$(openssl rand -hex 32)"
