@@ -8,11 +8,20 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${1:-/tmp/zeaz-backups}"
 mkdir -p "${OUT_DIR}"
 
-PLAIN_SQL="${OUT_DIR}/zeaz_${STAMP}.sql"
-ENC_FILE="${PLAIN_SQL}.enc"
+PLAIN_DUMP="${OUT_DIR}/zeaz_${STAMP}.dump"
+ENC_FILE="${PLAIN_DUMP}.enc"
 
-PGPASSWORD="${DB_PASS}" pg_dump -h db -U zeaz -d zeaz > "${PLAIN_SQL}"
-openssl enc -aes-256-cbc -salt -pbkdf2 -in "${PLAIN_SQL}" -out "${ENC_FILE}" -pass env:ADMIN_PASS
-rm -f "${PLAIN_SQL}"
+export PGPASSWORD="${DB_PASS}"
+pg_dump -h db -U zeaz -d zeaz -Fc -f "${PLAIN_DUMP}"
 
-echo "Encrypted backup written to ${ENC_FILE}"
+openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+  -in "${PLAIN_DUMP}" \
+  -out "${ENC_FILE}" \
+  -pass env:ADMIN_PASS
+
+SHA_FILE="${ENC_FILE}.sha256"
+sha256sum "${ENC_FILE}" > "${SHA_FILE}"
+rm -f "${PLAIN_DUMP}"
+
+echo "Encrypted backup: ${ENC_FILE}"
+echo "Checksum file: ${SHA_FILE}"
