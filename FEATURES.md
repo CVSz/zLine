@@ -25,7 +25,10 @@
 
 ## 3) Operational Tooling
 
-- `gen-secrets.sh`: generates the root `.env` file.
-- `start-zLineBot-automos.sh`: installs and manages the root Docker Compose stack as a service.
+- `installer/install.sh`: shared modular installer that prepares the full stack in system or project mode.
+- `installer/lib/*.sh`: reusable shell modules for logging, runtime setup, env generation, TLS, and stack staging.
+- `zeaz_ai_full_stack_installer.sh`: compatibility wrapper for system installs into `/opt/zLineBot-automos`.
+- `ubuntu_stack_installer.sh`: compatibility wrapper for preparing a local project copy in `./zlinebot-automos-stack`.
+- `start-zLineBot-automos.sh`: installs and manages the root Docker Compose stack as a systemd service.
 - `infrastructure/scripts/check-iac-policy.sh`: validates root `k8s/*.yaml` manifests.
 - `infrastructure/scripts/auto-fix-pipeline.sh`: applies safe formatting/permission remediation.
