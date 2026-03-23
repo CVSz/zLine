@@ -29,7 +29,7 @@ split between `zeaz-ultra/` and `zeaz-ultra-pack/`.
 
 ## Quick Start
 
-1. Generate the root runtime environment.
+1. Prepare the root runtime environment manually.
 
 ```bash
 ./gen-secrets.sh zlinebot-automos.local admin@zlinebot-automos.local
@@ -41,7 +41,13 @@ split between `zeaz-ultra/` and `zeaz-ultra-pack/`.
 docker compose up -d --build
 ```
 
-3. Useful local entrypoints:
+3. Or prepare the full stack with the modular installer.
+
+```bash
+sudo bash installer/install.sh --mode project --domain zlinebot-automos.local --app-dir ./zlinebot-automos-stack
+```
+
+4. Useful local entrypoints:
 
 - Web app: `https://<host>/`
 - API health: `https://<host>/api/health`
