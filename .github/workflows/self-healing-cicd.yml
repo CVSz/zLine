@@ -9,6 +9,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PYTHONUNBUFFERED: "1"
 
 permissions:
   contents: write
@@ -24,10 +25,14 @@ jobs:
     name: Validate, test, scan, and package
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
     outputs:
       ci_failed: ${{ steps.gate.outputs.ci_failed }}
 
     steps:
+      # ---------------------------
+      # Checkout
+      # ---------------------------
       - name: Checkout repository
         uses: actions/checkout@v5
 
@@ -57,45 +62,55 @@ jobs:
         id: npm_deps
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           npm ci
 
       - name: Install backend dependencies
         id: python_deps
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r backend/api/requirements.txt -r backend/worker/requirements.txt
 
       # ---------------------------
-      # Build & Test
+      # Build frontend
       # ---------------------------
       - name: Build frontend workspaces
         id: frontend_build
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           npm run build:frontend
           npm run build:landing
 
+      # ---------------------------
+      # Test (IMPROVED DEBUG)
+      # ---------------------------
       - name: Run FastAPI tests
         id: api_tests
         continue-on-error: true
         working-directory: backend/api
+        env:
+          # 👇 prevent common CI failures (override if needed)
+          DATABASE_URL: sqlite:///./test.db
+          ENVIRONMENT: test
         run: |
-          set -e
-          PYTHONPATH=. pytest tests -q
+          set -euo pipefail
+          PYTHONPATH=. pytest tests -vv --maxfail=1 --disable-warnings
 
+      # ---------------------------
+      # Python validation
+      # ---------------------------
       - name: Validate Python modules
         id: python_checks
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           python -m py_compile backend/api/main.py backend/worker/worker.py
 
       # ---------------------------
-      # Docker validation (FIXED)
+      # Docker validation (STABLE)
       # ---------------------------
       - name: Validate Docker Compose configuration
         id: compose
@@ -104,35 +119,30 @@ jobs:
           set -euo pipefail
 
           if ! command -v docker >/dev/null 2>&1; then
-            echo "Docker CLI not found on runner." >&2
+            echo "Docker CLI not found" >&2
             exit 1
           fi
 
-          # Start Docker daemon properly
           sudo systemctl start docker || true
-
           docker version
 
-          # Ensure Compose plugin exists
           if ! docker compose version >/dev/null 2>&1; then
-            echo "Installing docker-compose-plugin..."
+            echo "Installing docker compose plugin..."
             sudo apt-get update -y
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin
           fi
 
           docker compose version
-
-          # Validate compose config
           docker compose config -q
 
       # ---------------------------
       # IaC validation
       # ---------------------------
-      - name: IaC policy validation (OPA + Kyverno)
+      - name: IaC policy validation
         id: iac
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           chmod +x infrastructure/scripts/check-iac-policy.sh
           ./infrastructure/scripts/check-iac-policy.sh
 
@@ -143,7 +153,7 @@ jobs:
         id: trivy
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p .bin
           curl -fsSL https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_Linux-64bit.tar.gz -o /tmp/trivy.tgz
           tar -xzf /tmp/trivy.tgz -C .bin trivy
@@ -157,7 +167,7 @@ jobs:
         id: docker
         continue-on-error: true
         run: |
-          set -e
+          set -euo pipefail
           docker build -t zlinebot-automos-api:${{ github.sha }} backend/api
           docker build -t zlinebot-automos-worker:${{ github.sha }} backend/worker
           docker build -t zlinebot-automos-nginx:${{ github.sha }} -f infra/nginx.Dockerfile .
@@ -170,36 +180,33 @@ jobs:
         run: |
           failed=0
 
-          echo "npm_deps => ${{ steps.npm_deps.outcome }}"
-          echo "python_deps => ${{ steps.python_deps.outcome }}"
-          echo "frontend_build => ${{ steps.frontend_build.outcome }}"
-          echo "api_tests => ${{ steps.api_tests.outcome }}"
-          echo "python_checks => ${{ steps.python_checks.outcome }}"
-          echo "compose => ${{ steps.compose.outcome }}"
-          echo "iac => ${{ steps.iac.outcome }}"
-          echo "trivy => ${{ steps.trivy.outcome }}"
-          echo "docker => ${{ steps.docker.outcome }}"
+          check() {
+            name=$1
+            result=$2
+            echo "$name => $result"
+            [ "$result" = "failure" ] && failed=1
+          }
 
-          [ "${{ steps.npm_deps.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.python_deps.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.frontend_build.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.api_tests.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.python_checks.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.compose.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.iac.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.trivy.outcome }}" = "failure" ] && failed=1
-          [ "${{ steps.docker.outcome }}" = "failure" ] && failed=1
+          check npm_deps "${{ steps.npm_deps.outcome }}"
+          check python_deps "${{ steps.python_deps.outcome }}"
+          check frontend_build "${{ steps.frontend_build.outcome }}"
+          check api_tests "${{ steps.api_tests.outcome }}"
+          check python_checks "${{ steps.python_checks.outcome }}"
+          check compose "${{ steps.compose.outcome }}"
+          check iac "${{ steps.iac.outcome }}"
+          check trivy "${{ steps.trivy.outcome }}"
+          check docker "${{ steps.docker.outcome }}"
 
           echo "ci_failed=$failed" >> "$GITHUB_OUTPUT"
 
           if [ "$failed" -eq 1 ]; then
-            echo "One or more CI gates failed. Triggering self-heal job." >&2
+            echo "CI failed → triggering self-healing" >&2
             exit 1
           fi
 
-  # ===========================
+  # ===================================
   # SELF-HEALING JOB
-  # ===========================
+  # ===================================
   self-healing:
     name: AI-assisted self-heal
     if: failure() && needs.validate-and-build.outputs.ci_failed == '1'
@@ -220,7 +227,7 @@ jobs:
 
       - name: Run auto-fix pipeline
         run: |
-          set -e
+          set -euo pipefail
           chmod +x infrastructure/scripts/auto-fix-pipeline.sh
           ./infrastructure/scripts/auto-fix-pipeline.sh
 
@@ -232,13 +239,13 @@ jobs:
           body: |
             ## 🤖 Self-healing remediation PR
 
-            This PR was automatically generated after CI failures.
+            Triggered automatically due to CI failure.
 
-            ### Fixes applied
-            - Normalized script permissions
-            - Fixed YAML / formatting issues
-            - Prepared files for manual review
+            ### Included fixes
+            - Formatting / YAML cleanup
+            - Script permission normalization
+            - Basic auto-remediation attempts
 
-            ⚠️ Please review carefully before merging.
+            ⚠️ Manual review still required.
           branch: ci/self-healing/${{ github.run_id }}
           delete-branch: true
