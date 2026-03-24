@@ -243,3 +243,52 @@ def test_import_with_default_sqlite_does_not_create_db_file(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
     assert not (tmp_path / "zlinebot.db").exists()
+
+
+def test_branding_can_be_updated_by_admin(tmp_path: Path):
+    client = make_client(tmp_path)
+    session = register_and_login(client, username="brandadmin")
+    headers = auth_headers(session["access_token"], session["user"]["tenant_id"])
+
+    patch_response = client.patch(
+        "/api/branding",
+        json={"logo_url": "https://cdn.example.com/logo.png", "primary_color": "#112233"},
+        headers=headers,
+    )
+    get_response = client.get("/api/branding", headers=headers)
+
+    assert patch_response.status_code == 200
+    assert patch_response.json()["branding"]["primary_color"] == "#112233"
+    assert get_response.status_code == 200
+    assert get_response.json()["logo_url"] == "https://cdn.example.com/logo.png"
+
+
+def test_team_member_management_enforces_roles(tmp_path: Path):
+    client = make_client(tmp_path)
+    session = register_and_login(client, username="teamadmin")
+    headers = auth_headers(session["access_token"], session["user"]["tenant_id"])
+
+    create_staff = client.post(
+        "/api/team",
+        json={"username": "staff01", "password": "StaffPass123", "role": "staff"},
+        headers=headers,
+    )
+    staff_login = client.post(
+        "/api/login",
+        json={"username": "staff01", "password": "StaffPass123"},
+    )
+    staff_headers = auth_headers(staff_login.json()["access_token"], session["user"]["tenant_id"])
+    staff_forbidden = client.post(
+        "/api/team",
+        json={"username": "staff02", "password": "StaffPass123", "role": "staff"},
+        headers=staff_headers,
+    )
+    team_list = client.get("/api/team", headers=headers)
+
+    assert create_staff.status_code == 200
+    assert staff_login.status_code == 200
+    assert staff_forbidden.status_code == 403
+    assert team_list.status_code == 200
+    usernames = {member["username"] for member in team_list.json()}
+    assert "teamadmin" in usernames
+    assert "staff01" in usernames
