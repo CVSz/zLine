@@ -3,11 +3,15 @@ CREATE TABLE IF NOT EXISTS tenants (
   name TEXT UNIQUE NOT NULL,
   line_channel_token TEXT,
   line_channel_secret TEXT,
+  logo_url TEXT,
+  primary_color TEXT NOT NULL DEFAULT '#06b6d4',
   rate_limit_per_minute INTEGER NOT NULL DEFAULT 20,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS line_channel_secret TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS logo_url TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS primary_color TEXT NOT NULL DEFAULT '#06b6d4';
 
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,

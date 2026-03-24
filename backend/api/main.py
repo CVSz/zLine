@@ -55,6 +55,8 @@ class Tenant(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True)
     line_channel_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     line_channel_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    primary_color: Mapped[str] = mapped_column(String(16), default="#06b6d4")
     rate_limit_per_minute: Mapped[int] = mapped_column(Integer, default=20)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -159,6 +161,17 @@ class CheckoutPayload(BaseModel):
     cancel_url: str | None = None
 
 
+class TeamMemberPayload(BaseModel):
+    username: str
+    password: str
+    role: str = "staff"
+
+
+class BrandingPayload(BaseModel):
+    logo_url: str | None = None
+    primary_color: str | None = None
+
+
 class WebhookTextMessage(BaseModel):
     text: str = ""
 
@@ -213,6 +226,16 @@ class TemplateResponse(BaseModel):
     id: int
     name: str
     message: str
+    created_at: datetime
+
+
+class TeamMemberResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: str
+    tenant_id: str
     created_at: datetime
 
 
@@ -308,6 +331,13 @@ def extract_name(text: str) -> str | None:
 
 def clean_text(value: str | None) -> str:
     return (value or "").strip()
+
+
+def normalize_role(role: str | None) -> str:
+    normalized = clean_text(role).lower() or "staff"
+    if normalized not in {"admin", "staff", "superadmin"}:
+        raise HTTPException(status_code=400, detail="role must be one of: admin, staff")
+    return normalized
 
 
 def normalize_status(status: str | None, *, allow_blank: bool = False) -> str | None:
@@ -441,6 +471,9 @@ def serialize_campaign(campaign: Campaign) -> dict:
 def serialize_template(template: Template) -> dict:
     return TemplateResponse.model_validate(template).model_dump(mode="json")
 
+
+def serialize_team_member(user: User) -> dict:
+    return TeamMemberResponse.model_validate(user).model_dump(mode="json")
 
 
 def queue_broadcast_event(payload: dict) -> bool:
@@ -672,6 +705,98 @@ def create_app(database_url: str | None = None) -> FastAPI:
             "tenant_id": user.tenant_id,
             "subscription_status": user.subscription_status,
         }
+
+    @app.get("/api/branding")
+    def get_branding(
+        tenant_id: Annotated[str, Depends(get_tenant_scope)] = "",
+        session: Annotated[Session, Depends(db_session)] = None,
+    ):
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="tenant not found")
+        return {
+            "tenant_id": tenant.id,
+            "name": tenant.name,
+            "logo_url": tenant.logo_url,
+            "primary_color": tenant.primary_color or "#06b6d4",
+        }
+
+    @app.patch("/api/branding")
+    def update_branding(
+        payload: BrandingPayload,
+        tenant_id: Annotated[str, Depends(get_tenant_scope)] = "",
+        session: Annotated[Session, Depends(db_session)] = None,
+        _: Annotated[User, Depends(require_role("admin", "superadmin"))] = None,
+    ):
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="tenant not found")
+
+        if payload.logo_url is not None:
+            tenant.logo_url = clean_text(payload.logo_url) or None
+        if payload.primary_color is not None:
+            color = clean_text(payload.primary_color)
+            if color and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                raise HTTPException(status_code=400, detail="primary_color must be a hex color like #06b6d4")
+            tenant.primary_color = color or "#06b6d4"
+
+        session.commit()
+        session.refresh(tenant)
+        return {
+            "ok": True,
+            "branding": {
+                "tenant_id": tenant.id,
+                "name": tenant.name,
+                "logo_url": tenant.logo_url,
+                "primary_color": tenant.primary_color,
+            },
+        }
+
+    @app.get("/api/team")
+    def list_team_members(
+        tenant_id: Annotated[str, Depends(get_tenant_scope)] = "",
+        session: Annotated[Session, Depends(db_session)] = None,
+        _: Annotated[User, Depends(require_role("admin", "staff", "superadmin"))] = None,
+    ):
+        users = session.scalars(
+            select(User).where(User.tenant_id == tenant_id).order_by(User.created_at.asc(), User.id.asc())
+        ).all()
+        return [serialize_team_member(user) for user in users]
+
+    @app.post("/api/team")
+    def add_team_member(
+        payload: TeamMemberPayload,
+        tenant_id: Annotated[str, Depends(get_tenant_scope)] = "",
+        session: Annotated[Session, Depends(db_session)] = None,
+        _: Annotated[User, Depends(require_role("admin", "superadmin"))] = None,
+    ):
+        username = clean_text(payload.username)
+        if len(username) < 3 or not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+            raise HTTPException(
+                status_code=400,
+                detail="username may only contain letters, numbers, dots, dashes, and underscores",
+            )
+        if len(payload.password) < 8:
+            raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+
+        role = normalize_role(payload.role)
+        if role == "superadmin":
+            raise HTTPException(status_code=400, detail="role must be one of: admin, staff")
+
+        existing_user = session.scalar(select(User).where(User.username == username))
+        if existing_user is not None:
+            raise HTTPException(status_code=409, detail="username already exists")
+
+        member = User(
+            username=username,
+            password_hash=hash_password(payload.password),
+            role=role,
+            tenant_id=tenant_id,
+        )
+        session.add(member)
+        session.commit()
+        session.refresh(member)
+        return {"ok": True, "member": serialize_team_member(member)}
 
     @app.post("/api/chat")
     def chat(payload: ChatPayload):
