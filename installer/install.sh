@@ -106,11 +106,17 @@ if [[ -z "$ARCHIVE_PATH" ]]; then
   ARCHIVE_PATH="${APP_DIR%/}.tar.gz"
 fi
 
-require_root
+if [[ "$MODE" == "system" ]]; then
+  require_root
+fi
+
 require_cmds free df tar openssl
 preflight_checks
 
 if [[ "$INSTALL_DEPS" == "true" ]]; then
+  if [[ "$MODE" != "system" ]]; then
+    die "--skip-deps is required when using --mode project (apt installs require root)."
+  fi
   install_system_packages
 else
   require_cmds git

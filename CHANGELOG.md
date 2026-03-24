@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-03-24
+
+### Fixed
+- Fixed `scripts/deploy-images.sh` calling a non-existent script by replacing it with a complete deploy workflow that correctly builds, optionally pushes, and optionally applies Kubernetes manifests.
+- Fixed installer behavior so `installer/install.sh` only requires root in `--mode system`, while enforcing `--skip-deps` for `--mode project`.
+
+### Added
+- Added `scripts/run-stack.sh` as a unified runtime starter for `up/down/restart/logs/ps` operations.
+- Added repository governance and security docs: `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `LICENSE`, and `SECURITY.md`.
+
+### Changed
+- Expanded `scripts/build-images.sh` to support configurable image registry and tag parameters.
+- Refreshed `README.md` with full installer/config/deploy/starter guidance for production-ready operations.
+
 ## 2026-03-23
 
 ### Added
