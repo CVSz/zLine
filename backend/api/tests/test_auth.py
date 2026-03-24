@@ -183,3 +183,23 @@ def test_import_does_not_touch_database_at_module_import(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_import_with_default_sqlite_does_not_create_db_file(tmp_path: Path):
+    api_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("DATABASE_URL", None)
+    env["PYTHONPATH"] = str(api_root)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import main; print('ok')"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+    assert not (tmp_path / "zlinebot.db").exists()

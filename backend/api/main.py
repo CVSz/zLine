@@ -533,7 +533,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory
 
-    if urlparse(database_url or DEFAULT_DATABASE_URL).scheme == "sqlite":
+    if database_url is not None and urlparse(database_url).scheme == "sqlite":
         Base.metadata.create_all(bind=engine)
 
     app.add_middleware(
