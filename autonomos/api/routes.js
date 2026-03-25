@@ -54,6 +54,7 @@ function generateMarketData(size = 300, start = 100) {
   return candles;
 }
 
+router.get("/portfolio", (req, res) => {
 router.post("/auth/register", register);
 router.post("/auth/login", login);
 
@@ -90,12 +91,14 @@ router.get("/optimize", auth, async (req, res, next) => {
   }
 });
 
+router.get("/pipeline/tune", (req, res) => {
 router.get("/pipeline/tune", auth, (req, res) => {
   const candles = generateMarketData();
   const best = optimize(candles);
   return res.json(best);
 });
 
+router.post("/pipeline/run", async (req, res, next) => {
 router.post("/pipeline/run", auth, async (req, res, next) => {
   try {
     const candles = Array.isArray(req.body?.marketData) && req.body.marketData.length
@@ -117,6 +120,7 @@ router.post("/pipeline/run", auth, async (req, res, next) => {
   }
 });
 
+router.post("/kyc", (req, res) => {
 router.post("/trading/queue", auth, async (req, res, next) => {
   try {
     const userId = Number(req.body?.userId || req.user.id);
