@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zlinebot-config
+  namespace: zlinebot
+data:
+  NODE_ENV: "production"
+  API_PORT: "3000"
+  DASHBOARD_PORT: "8080"
+  DATABASE_HOST: "postgres-service"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "zlinebot"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  QUEUE_NAME: "zlinebot-jobs"
+  WEBHOOK_BASE_URL: "https://bot.zeaz.dev"
+  AWS_REGION: "us-east-1"
