@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zlinebot
+  labels:
+    app.kubernetes.io/name: zlinebot-automos
+    app.kubernetes.io/part-of: zlinebot-platform
