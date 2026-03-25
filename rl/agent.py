@@ -1,6 +1,7 @@
 import random
 from collections import deque
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -8,22 +9,40 @@ from model import DQN
 
 
 class Agent:
-    def __init__(self, state_dim: int, lr: float = 1e-3) -> None:
+    def __init__(
+        self,
+        state_dim: int,
+        lr: float = 1e-3,
+        gamma: float = 0.99,
+        epsilon: float = 1.0,
+        epsilon_min: float = 0.05,
+        epsilon_decay: float = 0.995,
+        target_sync_steps: int = 100,
+    ) -> None:
         self.model = DQN(state_dim)
         self.target = DQN(state_dim)
         self.target.load_state_dict(self.model.state_dict())
+        self.target.eval()
+
         self.memory = deque(maxlen=10_000)
-        self.gamma = 0.99
-        self.epsilon = 0.1
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.target_sync_steps = target_sync_steps
+        self.training_steps = 0
+
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
     def act(self, state):
         if random.random() < self.epsilon:
             return random.randint(0, 2)
+
         with torch.no_grad():
-            q_values = self.model(torch.FloatTensor(state))
-            return torch.argmax(q_values).item()
+            state_t = torch.tensor(state, dtype=torch.float32)
+            q_values = self.model(state_t)
+            return int(torch.argmax(q_values).item())
 
     def remember(self, exp):
         self.memory.append(exp)
@@ -33,23 +52,37 @@ class Agent:
             return None
 
         batch = random.sample(self.memory, batch_size)
-        losses = []
+        states, actions, rewards, next_states = zip(*batch)
 
-        for state, action, reward, next_state in batch:
-            target = torch.tensor(reward, dtype=torch.float32)
-            if next_state is not None:
-                next_q = self.target(torch.FloatTensor(next_state)).max().detach()
-                target = target + self.gamma * next_q
+        states_t = torch.tensor(np.asarray(states), dtype=torch.float32)
+        actions_t = torch.tensor(actions, dtype=torch.int64).unsqueeze(1)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)
 
-            pred = self.model(torch.FloatTensor(state))[action]
-            loss = self.loss_fn(pred, target)
+        current_q = self.model(states_t).gather(1, actions_t).squeeze(1)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            losses.append(loss.item())
+        next_q = torch.zeros(batch_size, dtype=torch.float32)
+        non_terminal_idx = [i for i, ns in enumerate(next_states) if ns is not None]
+        if non_terminal_idx:
+            next_state_t = torch.tensor(
+                np.asarray([next_states[i] for i in non_terminal_idx]), dtype=torch.float32
+            )
+            with torch.no_grad():
+                next_q_vals = self.target(next_state_t).max(dim=1).values
+            next_q[non_terminal_idx] = next_q_vals
 
-        return sum(losses) / len(losses)
+        target_q = rewards_t + (self.gamma * next_q)
+        loss = self.loss_fn(current_q, target_q)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.training_steps += 1
+        if self.training_steps % self.target_sync_steps == 0:
+            self.sync_target()
+
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        return float(loss.item())
 
     def sync_target(self):
         self.target.load_state_dict(self.model.state_dict())
