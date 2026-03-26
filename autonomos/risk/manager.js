@@ -1,22 +1,38 @@
-let dailyLoss = 0;
-const MAX_DAILY_LOSS = Number(process.env.MAX_DAILY_LOSS || -500);
+let realizedPnl = 0;
+
+function safeNumber(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function getMaxDailyLoss() {
+  return safeNumber(process.env.MAX_DAILY_LOSS, -500);
+}
 
 export function checkRisk(trade) {
-  const pnl = Number(trade?.pnl || 0);
-  dailyLoss += pnl;
+  const pnl = safeNumber(trade?.pnl, 0);
+  realizedPnl += pnl;
+  const maxDailyLoss = getMaxDailyLoss();
 
-  if (dailyLoss <= MAX_DAILY_LOSS) {
-    console.log("🛑 STOP TRADING (LOSS LIMIT)");
-    return false;
+  if (realizedPnl <= maxDailyLoss) {
+    return {
+      allowed: false,
+      reason: "max_daily_loss_reached",
+      state: getRiskState(),
+    };
   }
 
-  return true;
+  return {
+    allowed: true,
+    reason: "ok",
+    state: getRiskState(),
+  };
 }
 
 export function getRiskState() {
-  return { dailyLoss, maxDailyLoss: MAX_DAILY_LOSS };
+  return { realizedPnl, maxDailyLoss: getMaxDailyLoss() };
 }
 
 export function resetRisk() {
-  dailyLoss = 0;
+  realizedPnl = 0;
 }
