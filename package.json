@@ -13,5 +13,9 @@
     "build:landing": "npm --workspace landing run build",
     "stack:up": "docker compose up -d --build",
     "stack:down": "docker compose down"
+  },
+  "overrides": {
+    "esbuild": "0.25.0",
+    "picomatch": "4.0.4"
   }
 }
