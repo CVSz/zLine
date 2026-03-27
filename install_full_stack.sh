@@ -26,6 +26,9 @@ APP_DIR="/opt/zlinebot"
 K8S_NAMESPACE="zlinebot"
 NODE_IP="$(hostname -I | awk '{print $1}')"
 
+# enforce required variables
+: "${DOMAIN:?missing DOMAIN}"
+
 ############################
 # SYSTEM UPDATE
 ############################
@@ -173,6 +176,7 @@ until kubectl cluster-info >/dev/null 2>&1; do
 done
 # basic validation
 kubectl get nodes >/dev/null
+kubectl get namespace "${K8S_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${K8S_NAMESPACE}"
 
 ############################
 # INSTALL HELM (PINNED)
@@ -295,6 +299,12 @@ helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n 
 helm upgrade --install loki grafana/loki-stack -n monitoring -f /tmp/loki-values.yaml
 helm upgrade --install vault hashicorp/vault -n vault -f /tmp/vault-values.yaml
 
+############################
+# REMOVE VAULT (NOT CONFIGURED)
+############################
+log "⚠️ Removing Vault (not configured for production)"
+helm uninstall vault -n vault || true
+
 cat <<EOF_LIMIT | kubectl apply -f -
 apiVersion: v1
 kind: LimitRange
@@ -375,6 +385,13 @@ linkerd check
 linkerd viz install | kubectl apply -f -
 linkerd viz check
 kubectl label namespace "${K8S_NAMESPACE}" linkerd.io/inject=enabled --overwrite
+
+############################
+# DISABLE LINKERD (NO POLICY)
+############################
+log "⚠️ Disabling Linkerd (no traffic policy configured)"
+kubectl delete namespace linkerd >/dev/null 2>&1 || true
+kubectl delete namespace linkerd-viz >/dev/null 2>&1 || true
 
 ############################
 # EVENT-DRIVEN SYSTEM
@@ -487,6 +504,34 @@ spec:
                   key: password
 EOF_BACKUP
 
+cat <<EOF_BACKUP_CLEAN | kubectl apply -f -
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-clean
+  namespace: backup
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          volumes:
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-pvc
+          containers:
+          - name: cleaner
+            image: busybox:1.36
+            command: ["/bin/sh","-c"]
+            args:
+            - find /backup -type f -mtime +7 -delete
+            volumeMounts:
+            - name: backup-storage
+              mountPath: /backup
+EOF_BACKUP_CLEAN
+
 ############################
 # INGRESS CONTROLLER (NO HOST NGINX BYPASS)
 ############################
@@ -516,6 +561,14 @@ spec:
               number: 80
 EOF_ING
 log "🛡️ Skipping host-level NGINX reverse proxy to avoid ingress strategy conflicts."
+
+############################
+# KUBERNETES MANIFEST VALIDATION
+############################
+kubectl apply --dry-run=server -f k8s/ || {
+  echo "❌ Invalid Kubernetes manifests in k8s/"
+  exit 1
+}
 
 ############################
 # GITHUB ACTION TEMPLATE
@@ -556,16 +609,22 @@ env:
 EOF_GHA
 
 ############################
+# OPTIONAL: ARGOCD BOOTSTRAP
+############################
+log "⚡ Installing ArgoCD (GitOps bootstrap)..."
+kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+############################
 # FINAL MESSAGE
 ############################
 log "✅ INSTALL COMPLETE"
 echo ""
 echo "Next steps:"
 echo "1. Configure /etc/cloudflared/config.yml then: systemctl restart cloudflared"
-echo "2. Initialize/unseal Vault manually and configure auth/secret engines"
-echo "3. Create Ingress resources in k8s/ and push repo to trigger CI/CD"
-echo "1. Run: cloudflared tunnel login"
-echo "2. Create tunnel and route DNS explicitly (no wildcard shortcuts)"
-echo "3. Push repo to trigger CI/CD"
+echo "2. Run: cloudflared tunnel login"
+echo "3. Create tunnel and route DNS explicitly (no wildcard shortcuts)"
+echo "4. Push repo to trigger CI/CD"
+echo "5. Access ArgoCD and configure Applications for GitOps sync."
 echo ""
 echo "⚠️ For enterprise zero-trust, integrate OIDC proxy (Cloudflare Access / oauth2-proxy) and policy engine (OPA/Kyverno)."
