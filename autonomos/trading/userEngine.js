@@ -40,9 +40,6 @@ export async function runUser(userId, market = {}) {
     return { ok: false, signal, reason: "risk_blocked" };
   }
 
-  const execution = await executeTrade(signal, {
-    symbol: market.symbol || "BTCUSDT",
-    quantity: Number(market.quantity || 0.001),
   const symbol = market.symbol || "BTCUSDT";
   const quantity = Number(market.quantity || 0.001);
   const execution = await executeTrade(signal, {
@@ -74,6 +71,5 @@ export async function runUser(userId, market = {}) {
     ts: Date.now(),
   });
 
-  return { ok: true, signal, execution };
   return { ok: true, signal, execution, copiedCount: copied.length };
 }
