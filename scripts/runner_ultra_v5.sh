@@ -83,7 +83,7 @@ echo "[+] Fetching latest runner..."
 API_JSON=$(retry curl -fsSL https://api.github.com/repos/actions/runner/releases/latest) \
   || fail "GitHub API failed"
 
-URL=$(echo "$API_JSON" | jq -r '[.assets[] | select(.name|test("linux-x64"))][0].browser_download_url')
+URL=$(echo "$API_JSON" | jq -r '[.assets[] | select(.name|test("^actions-runner-linux-x64-.*\\.tar\\.gz$"))][0].browser_download_url')
 SHA_URL=$(echo "$API_JSON" | jq -r '[.assets[] | select(.name|test("sha256"))][0].browser_download_url')
 
 [[ -z "$URL" || "$URL" == "null" ]] && fail "Invalid runner URL"
@@ -104,9 +104,12 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   SIZE=$(stat -c%s "$TMP/runner.tar.gz")
   [[ "$SIZE" -lt 50000000 ]] && fail "Corrupt download (too small)"
 
+  echo "[DEBUG] Downloaded file:"
+  file "$TMP/runner.tar.gz"
+
   if [[ -n "$SHA_URL" && "$SHA_URL" != "null" ]]; then
     retry curl -fsSL "$SHA_URL" -o "$TMP/sha256.txt" || fail "Checksum download failed"
-    EXPECTED=$(grep linux-x64 "$TMP/sha256.txt" | awk '{print $1}' | head -n1)
+    EXPECTED=$(grep "linux-x64.*tar.gz" "$TMP/sha256.txt" | awk '{print $1}' | head -n1)
     ACTUAL=$(sha256sum "$TMP/runner.tar.gz" | awk '{print $1}')
 
     [[ -n "$EXPECTED" ]] || fail "SHA256 reference not found"
@@ -118,7 +121,9 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   mkdir -p "$TARGET_DIR"
   tar xzf "$TMP/runner.tar.gz" -C "$TARGET_DIR"
 
-  for f in runsvc.sh run.sh config.sh bin/Runner.Listener; do
+  [[ -f "$TARGET_DIR/runsvc.sh" ]] || fail "Missing runsvc.sh"
+  [[ -f "$TARGET_DIR/bin/Runner.Listener" ]] || fail "Missing runner binary"
+  for f in run.sh config.sh; do
     [[ -f "$TARGET_DIR/$f" ]] || fail "Missing $f"
   done
 
