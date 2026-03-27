@@ -30,6 +30,7 @@ fail() { echo "[❌] $1"; exit 1; }
 ok() { echo "[✅] $1"; }
 
 cleanup() {
+  exec 9>&- || true
   rm -f "$LOCK_FILE"
   if [[ -n "$TMP" && -d "$TMP" ]]; then
     rm -rf "$TMP"
@@ -40,9 +41,11 @@ retry() {
   local n=0
   local max=5
   local delay=2
+  local output
 
   while (( n < max )); do
-    if "$@"; then
+    if output=$("$@" 2>/dev/null); then
+      printf "%s" "$output"
       return 0
     fi
 
@@ -65,6 +68,12 @@ trap cleanup EXIT
 ########################################
 [[ $EUID -eq 0 ]] || fail "Run as root"
 [[ -n "$GITHUB_PAT" ]] || fail "Missing GITHUB_PAT"
+
+FREE_MEM=$(free -m | awk '/Mem:/ {print $7}')
+[[ "$FREE_MEM" -lt 512 ]] && fail "Low memory"
+
+FREE_DISK=$(df / | awk 'NR==2 {print $4}')
+[[ "$FREE_DISK" -lt 1048576 ]] && fail "Low disk"
 
 mkdir -p "$RELEASE_DIR"
 
@@ -97,11 +106,13 @@ URL="$(echo "$API_JSON" \
   | jq -er '[.assets[] | select(.name|test("^actions-runner-linux-x64-.*\\.tar\\.gz$"))][0].browser_download_url')" \
   || fail "Runner URL parse failed"
 SHA_URL="$(echo "$API_JSON" \
-  | jq -er '[.assets[] | select(.name|test("sha256"))][0].browser_download_url' 2>/dev/null || true)"
+  | jq -r '[.assets[] | select(.name|test("sha256"))][0].browser_download_url')"
+[[ "$SHA_URL" == "null" ]] && SHA_URL=""
 
 [[ -z "$URL" || "$URL" == "null" ]] && fail "Invalid runner URL"
 
 VERSION=$(echo "$URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+[[ -n "$VERSION" ]] || fail "Version parse failed"
 TARGET_DIR="${RELEASE_DIR}/runner-${VERSION}"
 
 ########################################
@@ -118,7 +129,7 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   [[ "$SIZE" -lt 50000000 ]] && fail "Corrupt download (too small)"
 
   echo "[DEBUG] Downloaded file:"
-  file "$TMP/runner.tar.gz"
+  command -v file >/dev/null && file "$TMP/runner.tar.gz"
 
   FILENAME=$(basename "$URL")
   if [[ -n "$SHA_URL" && "$SHA_URL" != "null" ]]; then
@@ -133,10 +144,14 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   tar tzf "$TMP/runner.tar.gz" >/dev/null || fail "Corrupt archive"
 
   mkdir -p "$TARGET_DIR"
-  tar xzf "$TMP/runner.tar.gz" -C "$TARGET_DIR"
+  tar xzf "$TMP/runner.tar.gz" -C "$TARGET_DIR" --strip-components=1 || true
+  if [[ ! -f "$TARGET_DIR/runsvc.sh" ]]; then
+    rm -rf "$TARGET_DIR"/*
+    tar xzf "$TMP/runner.tar.gz" -C "$TARGET_DIR" || fail "Extract failed"
+  fi
 
   [[ -f "$TARGET_DIR/runsvc.sh" ]] || fail "Missing runsvc.sh"
-  [[ -f "$TARGET_DIR/bin/Runner.Listener" ]] || fail "Missing runner binary"
+  [[ -x "$TARGET_DIR/bin/Runner.Listener" ]] || fail "Runner binary invalid"
   for f in run.sh config.sh; do
     [[ -f "$TARGET_DIR/$f" ]] || fail "Missing $f"
   done
@@ -149,6 +164,7 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   chown -R "$RUNNER_USER:$RUNNER_USER" "$TARGET_DIR"
 
   bash "$TARGET_DIR/bin/installdependencies.sh" || fail "Dependency install failed"
+  [[ -x "$TARGET_DIR/bin/Runner.Listener" ]] || fail "Runner binary not executable"
 fi
 
 ########################################
@@ -156,7 +172,8 @@ fi
 ########################################
 echo "[+] Switching runner..."
 
-systemctl stop "$SERVICE" || true
+systemctl stop "$SERVICE" 2>/dev/null || true
+sleep 2
 
 if [[ -L "$ACTIVE_LINK" ]]; then
   PREV=$(readlink -f "$ACTIVE_LINK")
@@ -168,6 +185,8 @@ ln -sfn "$TARGET_DIR" "$ACTIVE_LINK"
 
 RUNNER_DIR="$ACTIVE_LINK"
 [[ -f "$RUNNER_DIR/runsvc.sh" ]] || fail "New runner invalid"
+RUNNER_REAL_DIR=$(readlink -f "$RUNNER_DIR")
+[[ -n "$RUNNER_REAL_DIR" && -d "$RUNNER_REAL_DIR" ]] || fail "Runner real path invalid"
 
 ########################################
 # TOKEN
@@ -176,12 +195,13 @@ WORK_DIR="${BASE_DIR}/work-${RUNNER_NAME}"
 mkdir -p "$WORK_DIR"
 chown -R "$RUNNER_USER:$RUNNER_USER" "$WORK_DIR"
 
-TOKEN="$(retry curl "${CURL_ARGS[@]}" -X POST \
+RESP="$(retry curl "${CURL_ARGS[@]}" -X POST \
   -H "Authorization: token $GITHUB_PAT" \
   -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/$REPO/actions/runners/registration-token" \
-  | jq -er .token)" || fail "Token fetch failed"
+  "https://api.github.com/repos/$REPO/actions/runners/registration-token")" \
+  || fail "Token fetch failed"
 
+TOKEN="$(echo "$RESP" | jq -er .token)" || fail "Token parse failed"
 [[ "$TOKEN" == "null" || -z "$TOKEN" ]] && fail "Token invalid"
 
 ########################################
@@ -213,9 +233,9 @@ After=network.target
 
 [Service]
 User=$RUNNER_USER
-WorkingDirectory=$RUNNER_DIR
-ExecStartPre=/usr/bin/test -f "$RUNNER_DIR/runsvc.sh"
-ExecStart=/bin/bash $RUNNER_DIR/runsvc.sh
+WorkingDirectory=$RUNNER_REAL_DIR
+ExecStartPre=/usr/bin/test -f "$RUNNER_REAL_DIR/runsvc.sh"
+ExecStart=/bin/bash $RUNNER_REAL_DIR/runsvc.sh
 
 Restart=always
 RestartSec=5
